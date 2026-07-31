@@ -1,5 +1,7 @@
 # QQ ChatBot — AI 群聊机器人
 
+> GitHub: https://github.com/Shen-huang-123/qqbot-deepseek-yongchutafei
+
 ## 项目概览
 
 基于 NapCatQQ + Python FastAPI 的 QQ 机器人，使用 DeepSeek API（或其他 OpenAI 兼容接口）提供 AI 回复。支持私聊和群聊，带对话记忆、知识库和 Web 聊天面板。
