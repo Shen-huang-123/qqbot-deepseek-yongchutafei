@@ -1,0 +1,10 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+qrcode.png
+knowledge.db
+config.json
+网址.txt
+*.log

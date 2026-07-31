@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QQ ChatBot</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Microsoft YaHei',sans-serif;background:#f0f2f5;height:100vh;display:flex;justify-content:center;align-items:center}
+.c{width:420px;height:680px;background:#fff;border-radius:12px;box-shadow:0 2px 20px rgba(0,0,0,.1);display:flex;flex-direction:column;overflow:hidden}
+.h{background:#12b7f5;color:#fff;padding:16px;text-align:center;font-size:18px;font-weight:bold}
+.h small{font-size:12px;opacity:.8;display:block;margin-top:2px}
+.m{flex:1;overflow-y:auto;padding:16px;display:flex;flex-direction:column;gap:10px}
+.msg{max-width:80%;padding:10px 14px;border-radius:12px;word-break:break-word;font-size:14px;line-height:1.5}
+.msg.u{align-self:flex-end;background:#12b7f5;color:#fff;border-bottom-right-radius:4px}
+.msg.b{align-self:flex-start;background:#e8e8e8;color:#333;border-bottom-left-radius:4px}
+.msg.s{align-self:center;background:#fff3cd;color:#856404;font-size:12px;max-width:90%}
+.inp{display:flex;padding:12px;gap:8px;border-top:1px solid #eee;background:#fafafa}
+.inp input{flex:1;padding:10px 14px;border:1px solid #ddd;border-radius:20px;outline:none;font-size:14px}
+.inp input:focus{border-color:#12b7f5}
+.inp button{background:#12b7f5;color:#fff;border:none;padding:10px 20px;border-radius:20px;cursor:pointer;font-size:14px;white-space:nowrap}
+.inp button:hover{background:#0ea0d9}
+.qa{display:flex;gap:6px;padding:0 12px 8px;flex-wrap:wrap}
+.qa button{font-size:11px;padding:4px 10px;border:1px solid #12b7f5;color:#12b7f5;background:#fff;border-radius:12px;cursor:pointer}
+</style>
+</head>
+<body>
+<div class="c">
+<div class="h">🤖 QQ ChatBot<small>AI 聊天助手</small></div>
+<div class="m" id="m"><div class="msg b">你好！我是聊天机器人<br>📝 喂数据:xxx 存入知识<br>🔍 查询:xxx 搜索知识<br>📊 知识统计 查看总量</div></div>
+<div class="qa">
+<button onclick="sq('知识统计')">📊 统计</button>
+<button onclick="document.getElementById('i').value='喂数据:';document.getElementById('i').focus()">📝 喂数据</button>
+<button onclick="document.getElementById('i').value='查询:';document.getElementById('i').focus()">🔍 查询</button>
+</div>
+<div class="inp">
+<input id="i" placeholder="输入消息..." onkeydown="if(event.key==='Enter')s()">
+<button onclick="s()">发送</button>
+</div>
+</div>
+<script>
+const API='';
+function am(t,p){const d=document.createElement('div');d.className='msg '+p;d.textContent=t;m.appendChild(d);m.scrollTop=m.scrollHeight}
+function sq(t){i.value=t;s()}
+async function s(){
+const t=i.value.trim();if(!t)return;am(t,'u');i.value='';
+try{
+const r=await fetch(API+'/',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({post_type:'message',message_type:'private',sender:{user_id:'web'},raw_message:t})});
+const d=await r.json();
+am(d.reply||'无响应','b');
+}catch(e){am('连接失败，请确认服务已启动','s')}
+}
+</script>
+</body>
+</html>
