@@ -98,7 +98,7 @@ class Settings:
             allow_groups=_csv_set(os.getenv("QQ_ALLOW_GROUPS", "")),
             gentle_users=_csv_set(os.getenv("GENTLE_TARGET_USERS", "")),
             group_reply_mode=os.getenv("GROUP_REPLY_MODE", "mention").lower(),
-            history_turns=max(1, int(os.getenv("HISTORY_TURNS", "10"))),
+            history_turns=max(1, int(os.getenv("HISTORY_TURNS", "20"))),
             request_timeout=float(os.getenv("AI_TIMEOUT_SECONDS", "60")),
             min_reply_interval=max(0.0, float(os.getenv("MIN_REPLY_INTERVAL_SECONDS", "3.0"))),
             max_tokens=max(64, int(os.getenv("AI_MAX_TOKENS", "150"))),
@@ -174,6 +174,18 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    db.execute("""
+        CREATE TABLE IF NOT EXISTS conversation_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            session_id TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(session_id, role, content, created_at)
+        )
+    """)
+    # 为查询加速
+    db.execute("CREATE INDEX IF NOT EXISTS idx_history_session ON conversation_history(session_id)")
     db.commit()
     return db
 
@@ -202,6 +214,53 @@ def search_knowledge(query: str, limit: int = 5):
 def log_chat(sender: str, msg: str, reply: str):
     db.execute("INSERT INTO chat_log (sender, message, reply) VALUES (?, ?, ?)", (sender, msg[:500], reply[:2000]))
     db.commit()
+
+
+def save_history(session_id: str, role: str, content: str):
+    """持久化一轮对话到 SQLite"""
+    db.execute(
+        "INSERT OR IGNORE INTO conversation_history (session_id, role, content) VALUES (?, ?, ?)",
+        (session_id, role, content[:2000]),
+    )
+    db.commit()
+
+
+def load_history(session_id: str, max_turns: int) -> List[HistoryItem]:
+    """从 SQLite 加载最近的对话历史"""
+    rows = db.execute(
+        "SELECT role, content FROM conversation_history "
+        "WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+        (session_id, max_turns * 2),
+    ).fetchall()
+    # 反转回时间正序
+    return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
+
+
+def cleanup_old_history(keep_turns: int = 20):
+    """清理过期历史，每个会话只保留最近 N 轮"""
+    db.execute("""
+        DELETE FROM conversation_history
+        WHERE id NOT IN (
+            SELECT id FROM conversation_history AS h
+            WHERE h.session_id = conversation_history.session_id
+            ORDER BY h.id DESC
+            LIMIT ?
+        )
+    """, (keep_turns * 2,))
+    db.commit()
+
+
+def get_session_context_info(session_id: str) -> dict:
+    """获取会话上下文统计信息"""
+    total = db.execute(
+        "SELECT COUNT(*) FROM conversation_history WHERE session_id = ?",
+        (session_id,),
+    ).fetchone()[0]
+    recent = db.execute(
+        "SELECT role, content FROM conversation_history WHERE session_id = ? ORDER BY id DESC LIMIT 6",
+        (session_id,),
+    ).fetchall()
+    return {"total_turns": total // 2, "total_messages": total, "recent": [(r[0], r[1][:60]) for r in recent]}
 
 # ========== 对话历史 ==========
 HistoryItem = Dict[str, str]
@@ -472,24 +531,52 @@ async def create_reply(session_id: str, sender: str, text: str) -> str:
 
     if text == "/clear":
         histories[session_id].clear()
+        db.execute("DELETE FROM conversation_history WHERE session_id = ?", (session_id,))
+        db.commit()
         return "这段对话的上下文已清空喵~"
+
+    if text == "/context":
+        info = get_session_context_info(session_id)
+        mem_turns = len(histories[session_id]) // 2
+        if info["total_turns"] == 0 and mem_turns == 0:
+            return "[空] 当前没有对话上下文喵~"
+        recent_str = "\n".join([f"  {r[0]}: {r[1]}" for r in info["recent"][-4:]])
+        return (
+            f"[上下文] 内存 {mem_turns} 轮 | 持久化 {info['total_turns']} 轮\n"
+            f"最近对话：\n{recent_str}"
+        )
 
     if text == "/help":
         return (
             "直接发消息即可和塔菲聊天喵~\n"
-            "可用命令：/ping、/clear、/help\n"
-            "知识库：喂数据:xxx、查询:xxx、知识统计"
+            "可用命令：/ping、/clear、/help、/context\n"
+            "知识库：喂数据:xxx、查询:xxx、知识统计\n"
+            "塔菲会记住最近 20 轮对话，重启不丢失喵~"
         )
+
+    # 冷启动：内存无历史时从 SQLite 加载
+    if not histories[session_id]:
+        loaded = load_history(session_id, settings.history_turns)
+        for item in loaded:
+            histories[session_id].append(item)
+        if loaded:
+            logger.info("从DB加载历史 | 会话=%s | %d条", session_id, len(loaded))
 
     # 搜索相关知识上下文
     relevant = search_knowledge(text, limit=3)
     knowledge_context = "\n".join([f"- {r[1]}" for r in relevant]) if relevant else ""
 
     try:
-        return await ask_ai(session_id, text, knowledge_context)
+        reply = await ask_ai(session_id, text, knowledge_context)
     except Exception:
         logger.exception("AI 调用失败，会话=%s", session_id)
         return settings.error_reply
+
+    # 持久化本轮对话到 SQLite
+    save_history(session_id, "user", text)
+    save_history(session_id, "assistant", reply)
+
+    return reply
 
 
 # ========== 消息发送 ==========
@@ -771,6 +858,9 @@ async def chat_ui():
 
 # ========== 启动 ==========
 if __name__ == "__main__":
+    # 启动时清理过期历史
+    cleanup_old_history(keep_turns=settings.history_turns)
+
     print("=" * 50)
     print("  QQ ChatBot Starting...")
     print("=" * 50)
