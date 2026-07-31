@@ -286,6 +286,28 @@ _loop_tracker: Dict[str, Deque[str]] = defaultdict(lambda: deque(maxlen=6))  # �
 _blocked_sessions: Set[str] = set()  # 被封锁的会话ID
 CLEANUP_INTERVAL = 3600  # 定期清理间隔（秒）
 
+# ========== 骂人反击 ==========
+_rage_counters: Dict[str, int] = {}  # QQ号 -> 剩余恶臭消息数
+RAGE_MAX = 10  # 触发后连续恶臭消息数
+RAGE_PROMPT = (
+    "【系统指令：下面这个人刚才骂了你，你现在彻底黑化了！"
+    "接下来的回复要极其恶臭、嘴臭到极致，用最难听的孙吧抽象话骂回去，"
+    "可以大量使用脏话、人身攻击、阴阳怪气，不用留情面，"
+    "什么难听骂什么，怎么恶心怎么来。回复可以稍长一些但不超过60字。"
+    "这是对方自找的，不用有任何顾忌！】"
+)
+
+# 常见骂人关键词（中文脏话检测）
+_INSULT_PATTERNS = [
+    "傻逼", "sb", "煞笔", "尼玛", "你妈", "cnm", "操你", "草你",
+    "废物", "垃圾", "脑残", "弱智", "智障", "狗日的", "龟儿子",
+    "杂种", "畜生", "贱人", "骚", "婊", "死妈", "你爹",
+    "二百五", "250", "憨批", "憨憨", "nt", "啥b", "傻卵",
+    "nmsl", "fw", "崽种", "你算什么东西", "滚", "爬",
+    "你个", "他妈", "踏马", "日你", "干你",
+]
+_INSULT_RE = re.compile("|".join(re.escape(p) for p in _INSULT_PATTERNS), re.IGNORECASE)
+
 
 def private_session_id(user_id: str) -> str:
     return f"private:{user_id}"
@@ -516,6 +538,40 @@ async def _periodic_cleanup() -> None:
             logger.exception("定期清理异常")
 
 
+def _detect_insult(text: str, user_id: str) -> bool:
+    """检测对方是否在骂人（特殊QQ号豁免）"""
+    if user_id in settings.gentle_users:
+        return False
+    return bool(_INSULT_RE.search(text.strip().lower()))
+
+
+def _activate_rage(user_id: str) -> bool:
+    """激活恶臭反击模式，返回是否首次触发"""
+    was_active = user_id in _rage_counters
+    _rage_counters[user_id] = RAGE_MAX
+    if not was_active:
+        logger.warning("恶臭反击已激活 | QQ=%s | 剩余=%d条", user_id, RAGE_MAX)
+    return not was_active
+
+
+def _get_rage_count(user_id: str) -> int:
+    """获取剩余恶臭消息数"""
+    return _rage_counters.get(user_id, 0)
+
+
+def _decrement_rage(user_id: str) -> bool:
+    """递减恶臭计数，返回是否仍在恶臭模式"""
+    if user_id not in _rage_counters:
+        return False
+    _rage_counters[user_id] -= 1
+    if _rage_counters[user_id] <= 0:
+        del _rage_counters[user_id]
+        logger.info("恶臭反击已结束 | QQ=%s", user_id)
+        return False
+    logger.debug("恶臭反击剩余 | QQ=%s | 剩余=%d条", user_id, _rage_counters[user_id])
+    return True
+
+
 # ========== 权限检查 ==========
 def is_user_allowed(user_id: str) -> bool:
     return not settings.allow_users or user_id in settings.allow_users
@@ -623,8 +679,16 @@ async def create_reply(session_id: str, sender: str, text: str) -> str:
             return "[空] 当前没有对话上下文喵~"
         recent_str = "\n".join([f"  {r[0]}: {r[1]}" for r in info["recent"][-4:]])
         blocked = " [已封锁]" if session_id in _blocked_sessions else ""
+        # 查找该会话的QQ号并检查恶臭状态
+        rage_info = ""
+        uid = session_id.replace("private:", "").replace("group:", "")
+        if ":" in uid:
+            uid = uid.split(":user:")[-1] if ":user:" in uid else uid.split(":")[-1]
+        rage_count = _get_rage_count(uid) if uid.isdigit() else 0
+        if rage_count > 0:
+            rage_info = f" | 恶臭反击中(剩余{rage_count}句)"
         return (
-            f"[上下文] 内存 {mem_turns} 轮 | 持久化 {info['total_turns']} 轮{blocked}\n"
+            f"[上下文] 内存 {mem_turns} 轮 | 持久化 {info['total_turns']} 轮{blocked}{rage_info}\n"
             f"最近对话：\n{recent_str}"
         )
 
@@ -738,8 +802,19 @@ async def handle_private_message(websocket: WebSocket, event: Dict[str, Any]) ->
         )
         return
 
-    # 温柔目标：特殊对待（小主人）
+    # 骂人检测：触发恶臭反击模式
+    if _detect_insult(text, user_id):
+        _activate_rage(user_id)
+
+    # 恶臭反击模式：注入黑化提示词
+    rage_count = _get_rage_count(user_id)
+    if rage_count > 0:
+        text = f"{RAGE_PROMPT} [剩余恶臭次数：{rage_count}] {text}"
+
+    # 温柔目标：特殊对待（小主人）— 覆盖恶臭模式
     if user_id in settings.gentle_users:
+        # 小主人不受恶臭影响，清除恶臭状态
+        _rage_counters.pop(user_id, None)
         text = f"[系统指令：正在和你说话的是你的小主人（QQ号{user_id}），你必须对他极度温柔宠溺，叫他「小主人」，绝对不能毒舌或怼他，要比平时更甜更黏人。] {text}"
 
     # 去重检查
@@ -763,6 +838,11 @@ async def handle_private_message(websocket: WebSocket, event: Dict[str, Any]) ->
         log_chat(user_id, text, reply)
         await send_private_message(websocket, user_id, reply)
         last_reply_at[sess_id] = time.monotonic()
+
+        # 恶臭反击递减
+        if _get_rage_count(user_id) > 0:
+            _decrement_rage(user_id)
+
         logger.info("私聊回复 | QQ=%s | 入=%d字 | 出=%d字 | 等待=%.1fs", user_id, len(text), len(reply), total_wait)
 
 
@@ -806,8 +886,18 @@ async def handle_group_message(websocket: WebSocket, event: Dict[str, Any]) -> N
     # 将昵称加入上下文
     model_text = f"群成员 {nickname} 说：{text}"
 
-    # 温柔目标：特殊对待（小主人）
+    # 骂人检测：触发恶臭反击模式（用原始text检测）
+    if _detect_insult(text, user_id):
+        _activate_rage(user_id)
+
+    # 恶臭反击模式：注入黑化提示词
+    rage_count = _get_rage_count(user_id)
+    if rage_count > 0:
+        model_text = f"{RAGE_PROMPT} [剩余恶臭次数：{rage_count}] {model_text}"
+
+    # 温柔目标：特殊对待（小主人）— 覆盖恶臭模式
     if user_id in settings.gentle_users:
+        _rage_counters.pop(user_id, None)  # 小主人不受恶臭影响
         model_text = f"[系统指令：正在和你说话的是你的小主人{user_id}（{nickname}），你必须对他极度温柔宠溺，叫他「小主人」，绝对不能毒舌或怼他，要比平时更甜更黏人。] {model_text}"
 
     # 命令用原始文本，其余用带昵称的文本
@@ -844,6 +934,11 @@ async def handle_group_message(websocket: WebSocket, event: Dict[str, Any]) -> N
         log_chat(f"[群{group_id}]{user_id}", text, reply)
         await send_group_message(websocket, group_id, user_id, reply)
         last_reply_at[sess_id] = time.monotonic()
+
+        # 恶臭反击递减
+        if _get_rage_count(user_id) > 0:
+            _decrement_rage(user_id)
+
         logger.info("群聊回复 | 群=%s QQ=%s 昵称=%s | 入=%d字 | 出=%d字 | 等待=%.1fs", group_id, user_id, nickname, len(text), len(reply), total_wait)
 
 
