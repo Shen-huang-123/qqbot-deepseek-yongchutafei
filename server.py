@@ -572,6 +572,114 @@ def _decrement_rage(user_id: str) -> bool:
     return True
 
 
+# ========== 网络检索 ==========
+SEARCH_AUTO_TRIGGERS = [
+    "查一下", "搜一下", "帮我查", "帮我搜", "搜索", "查查",
+    "帮我写", "写一个", "写代码", "帮我找", "有没有",
+    "什么是", "怎么", "如何", "最新", "今天",
+]
+
+async def web_search(query: str, max_results: int = 5) -> List[Dict[str, str]]:
+    """使用 DuckDuckGo 搜索，返回结果列表 [{title, url, snippet}]"""
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(
+                "https://html.duckduckgo.com/html/",
+                params={"q": query},
+                headers={"User-Agent": "QQChatBot/1.0"},
+                follow_redirects=True,
+            )
+            if resp.status_code != 200:
+                logger.warning("搜索失败 HTTP %d", resp.status_code)
+                return []
+
+            # 简单解析 HTML 搜索结果
+            from html.parser import HTMLParser
+
+            class DDHtmlParser(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.results = []
+                    self.current = {}
+                    self.in_result = False
+                    self.in_title = False
+                    self.in_snippet = False
+                    self.text_buf = ""
+
+                def handle_starttag(self, tag, attrs):
+                    attrs_dict = dict(attrs)
+                    cls = attrs_dict.get("class", "")
+                    if tag == "a" and "result__a" in cls:
+                        self.in_result = True
+                        self.in_title = True
+                        self.current = {"title": "", "url": "", "snippet": ""}
+                        href = attrs_dict.get("href", "")
+                        self.current["url"] = href
+                        self.text_buf = ""
+                    elif tag == "a" and "result__snippet" in cls:
+                        self.in_snippet = True
+                        self.text_buf = ""
+
+                def handle_endtag(self, tag):
+                    if self.in_title and tag == "a":
+                        self.in_title = False
+                        self.current["title"] = self.text_buf.strip()
+                        self.text_buf = ""
+                    elif self.in_snippet and tag == "a":
+                        self.in_snippet = False
+                        self.current["snippet"] = self.text_buf.strip()
+                        self.text_buf = ""
+                        if self.current.get("title"):
+                            self.results.append(self.current)
+                        self.current = {}
+
+                def handle_data(self, data):
+                    if self.in_title or self.in_snippet:
+                        self.text_buf += data
+
+            parser = DDHtmlParser()
+            parser.feed(resp.text)
+
+            results = parser.results[:max_results]
+            logger.info("搜索完成 | query=%s | 结果=%d条", query[:50], len(results))
+            return results
+
+    except Exception:
+        logger.exception("搜索异常 | query=%s", query[:50])
+        return []
+
+
+def _should_auto_search(text: str) -> Optional[str]:
+    """检测是否需要自动搜索，返回搜索词或 None"""
+    text_stripped = text.strip()
+    # 命令消息不自动搜索
+    if text_stripped.startswith("/") or text_stripped.startswith("喂数据") or text_stripped.startswith("查询") or text_stripped == "知识统计":
+        return None
+    # 匹配触发词
+    for trigger in SEARCH_AUTO_TRIGGERS:
+        if trigger in text_stripped:
+            # 提取搜索关键词（去掉触发词后的内容）
+            query = text_stripped
+            for t in SEARCH_AUTO_TRIGGERS:
+                query = query.replace(t, " ")
+            query = " ".join(query.split()).strip()
+            if len(query) >= 2:
+                return query
+    return None
+
+
+def _format_search_results(results: List[Dict[str, str]]) -> str:
+    """格式化搜索结果为 AI 可读文本"""
+    if not results:
+        return ""
+    lines = ["【网络搜索结果】"]
+    for i, r in enumerate(results, 1):
+        title = r.get("title", "无标题")[:100]
+        snippet = r.get("snippet", "")[:200]
+        lines.append(f"{i}. {title}\n   {snippet}")
+    return "\n".join(lines)
+
+
 # ========== 权限检查 ==========
 def is_user_allowed(user_id: str) -> bool:
     return not settings.allow_users or user_id in settings.allow_users
@@ -697,12 +805,23 @@ async def create_reply(session_id: str, sender: str, text: str) -> str:
             return "会话已解除封锁喵~可以继续聊天了"
         return "当前会话没有被封锁喵~"
 
+    if text.startswith("/search") or text.startswith("/搜索"):
+        query = text.replace("/search", "").replace("/搜索", "").strip()
+        if not query:
+            return "用法：/search 搜索内容 或 /搜索 搜索内容喵~"
+        results = await web_search(query)
+        if not results:
+            return f"没搜到「{query}」相关的内容喵~等会儿再试试？"
+        return _format_search_results(results)
+
     if text == "/help":
         return (
             "直接发消息即可和塔菲聊天喵~\n"
             "可用命令：/ping、/clear、/help、/context\n"
+            "网络搜索：/search xxx 或 /搜索 xxx\n"
             "知识库：喂数据:xxx、查询:xxx、知识统计\n"
-            "塔菲会记住最近 20 轮对话，重启不丢失喵~"
+            "塔菲会记住最近 20 轮对话，重启不丢失喵~\n"
+            "问塔菲「查一下」「帮我写代码」会自动上网搜喵~"
         )
 
     # 冷启动：内存无历史时从 SQLite 加载
@@ -713,12 +832,29 @@ async def create_reply(session_id: str, sender: str, text: str) -> str:
         if loaded:
             logger.info("从DB加载历史 | 会话=%s | %d条", session_id, len(loaded))
 
-    # 搜索相关知识上下文
+    # 自动网络搜索检测
+    search_context = ""
+    auto_query = _should_auto_search(text)
+    if auto_query:
+        logger.info("自动搜索触发 | query=%s", auto_query[:50])
+        search_results = await web_search(auto_query, max_results=3)
+        search_context = _format_search_results(search_results)
+
+    # 搜索知识库上下文
     relevant = search_knowledge(text, limit=3)
     knowledge_context = "\n".join([f"- {r[1]}" for r in relevant]) if relevant else ""
 
+    # 合并知识库 + 搜索结果
+    combined_context = knowledge_context
+    if search_context:
+        combined_context = f"{search_context}\n\n{knowledge_context}" if knowledge_context else search_context
+
+    # 如果有搜索结果，追加系统指令让 AI 参考
+    if search_context:
+        text = f"{text}\n\n[系统指令：以下是网络搜索到的最新信息，请参考这些信息来回答，如果是写代码需求请直接给出代码：]\n{search_context}"
+
     try:
-        reply = await ask_ai(session_id, text, knowledge_context)
+        reply = await ask_ai(session_id, text, combined_context)
     except Exception:
         logger.exception("AI 调用失败，会话=%s", session_id)
         return settings.error_reply
