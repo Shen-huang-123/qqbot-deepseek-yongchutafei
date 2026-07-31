@@ -183,11 +183,38 @@ AI_MODEL=qwen3:8b
 
 1. **消息解析**：使用 `extract_plain_text()` 处理 OneBot 消息数组格式
 2. **会话隔离**：私聊和群聊使用不同的 session_id 前缀
-3. **频率限制**：通过 `last_reply_at` 字典实现，不要绕过
+3. **频率限制**：通过 `last_reply_at` 字典实现，叠加 `_random_jitter()` 随机延迟
 4. **配置读取**：优先 `.env`，回退到 `config.json`（向后兼容）
 5. **API 调用**：通过 `ask_ai()` 函数，自动附带对话历史
 6. **群聊 @检测**：使用 `mentions_self()` 函数，兼容数组和字符串格式
 7. **知识库**：SQLite 数据库，表结构在 `init_db()` 中定义
-8. **消息发送**：使用 `send_private_message()` / `send_group_message()`，自动分段
+8. **消息发送**：使用 `send_private_message()` / `send_group_message()`，自动分段、URL 过滤和全局限流
 9. **日志**：使用 `logging.getLogger("qq-chat-bot")`，不要用 print
 10. **不要硬编码密钥**：所有敏感配置从环境变量读取
+
+## 风控防护（Anti-Fengkong）
+
+修改消息发送逻辑时必须遵守的风控规则：
+
+1. **`_global_rate_limit()`** — 每发送一条消息前必须调用，自动等待并记录全局发送时间
+2. **`_filter_urls(text)`** — 在 send 函数中对 AI 回复调用，替换 URL 为文本占位符，避免 QQ 1200 超时拦截
+3. **`_is_duplicate(session_id, text)`** — 在 handle 函数中检查，10 秒内相同内容不重复回复
+4. **`_user_cooldown(session_id)`** — 在频率限制前调用，对连续快速触发用户施加递增冷却（5 倍封顶）
+5. **`_random_jitter()`** — 在频率等待计算中叠加 0~jitter 秒随机延迟，破坏机器人行为特征
+6. **`_check_daily_cap()`** — 每次成功发送后调用，80% 日志提醒，100% 警告
+7. **分段消息必须有段间延迟** — `send_*_message` 中 for 循环必须在每段之间 `await asyncio.sleep(inter_segment_delay)`
+8. **不要绕过全局速率限制** — 所有对外 WebSocket action 都必须经过 `_global_rate_limit()`
+9. **新配置项必须有安全默认值** — 新增风控相关配置遵循 `.env.example` 的命名和默认值规范
+10. **风控事件记录日志** — 使用 `logger.warning` 记录限流、冷却、URL 过滤等风控触发事件
+
+### 风控参数说明
+
+| 参数 | 默认值 | 作用 |
+|------|--------|------|
+| `MIN_REPLY_INTERVAL_SECONDS` | 3.0s | 基础回复间隔 |
+| `REPLY_JITTER_SECONDS` | 2.0s | 随机抖动范围 |
+| `INTER_SEGMENT_DELAY_SECONDS` | 1.5s | 长消息分段间延迟 |
+| `GLOBAL_RATE_LIMIT_COUNT/ WINDOW` | 20条/60s | 全局滑动窗口限流 |
+| `DAILY_MSG_CAP` | 300条 | 日发送量预警 |
+| `URL_REPLACE_MODE` | replace | URL 替换策略 |
+| `ESCALATION_COOLDOWN` | true | 渐进冷却开关 |

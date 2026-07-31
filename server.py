@@ -5,9 +5,11 @@ QQ 聊天机器人 - AI 后端服务
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import time
@@ -15,7 +17,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Deque, Dict, List, Optional, Set
+from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
 import httpx
 import uvicorn
@@ -57,6 +59,14 @@ class Settings:
     gentle_users: Set[str]
     error_reply: str
     log_level: str
+    # 风控保护
+    reply_jitter_seconds: float
+    inter_segment_delay: float
+    global_rate_limit_count: int
+    global_rate_limit_window: float
+    daily_message_cap: int
+    url_replace_mode: str
+    escalation_cooldown: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -90,10 +100,18 @@ class Settings:
             group_reply_mode=os.getenv("GROUP_REPLY_MODE", "mention").lower(),
             history_turns=max(1, int(os.getenv("HISTORY_TURNS", "10"))),
             request_timeout=float(os.getenv("AI_TIMEOUT_SECONDS", "60")),
-            min_reply_interval=max(0.0, float(os.getenv("MIN_REPLY_INTERVAL_SECONDS", "1.5"))),
-            max_tokens=max(64, int(os.getenv("AI_MAX_TOKENS", "300"))),
+            min_reply_interval=max(0.0, float(os.getenv("MIN_REPLY_INTERVAL_SECONDS", "3.0"))),
+            max_tokens=max(64, int(os.getenv("AI_MAX_TOKENS", "150"))),
             error_reply=os.getenv("ERROR_REPLY", "塔菲刚才走神了喵~等会儿再来！"),
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
+            # 风控保护
+            reply_jitter_seconds=float(os.getenv("REPLY_JITTER_SECONDS", "2.0")),
+            inter_segment_delay=float(os.getenv("INTER_SEGMENT_DELAY_SECONDS", "1.5")),
+            global_rate_limit_count=int(os.getenv("GLOBAL_RATE_LIMIT_COUNT", "20")),
+            global_rate_limit_window=float(os.getenv("GLOBAL_RATE_LIMIT_WINDOW", "60")),
+            daily_message_cap=int(os.getenv("DAILY_MSG_CAP", "300")),
+            url_replace_mode=os.getenv("URL_REPLACE_MODE", "replace"),
+            escalation_cooldown=os.getenv("ESCALATION_COOLDOWN", "true").lower() in ("1", "true", "yes"),
         )
 
 
@@ -194,6 +212,16 @@ user_locks: Dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 last_reply_at: Dict[str, float] = {}
 send_lock = asyncio.Lock()
 
+# ========== 风控保护状态 ==========
+_global_send_times: Deque[float] = deque()          # 全局发送时间戳滑动窗口
+_dedup_cache: Dict[str, float] = {}                  # 去重缓存: key -> timestamp
+_user_cooldowns: Dict[str, Tuple[int, float]] = {}   # 用户冷却: sess_id -> (快速触发次数, 当前冷却秒数)
+_daily_count: int = 0                                # 今日发送计数
+_daily_reset_date: str = ""                          # 计数重置日期 "YYYY-MM-DD"
+_URL_PATTERN: re.Pattern = re.compile(
+    r'https?://[^\s<>"\')\]>]+'
+)
+
 
 def private_session_id(user_id: str) -> str:
     return f"private:{user_id}"
@@ -237,10 +265,115 @@ def mentions_self(message: Any, self_id: str) -> bool:
     )
 
 
-def split_reply(text: str, size: int = 1800) -> List[str]:
-    """将长文本分段，避免超过 QQ 消息长度限制"""
+def split_reply(text: str, size: int = 800) -> List[str]:
+    """将长文本分段，避免超过 QQ 消息长度限制（风控优化：降低到 800 字减少分段爆发送）"""
     text = text.strip()
     return [text[index: index + size] for index in range(0, len(text), size)] or [""]
+
+
+# ========== 风控保护函数 ==========
+def _random_jitter() -> float:
+    """返回随机抖动延迟（0 到 reply_jitter_seconds 之间）"""
+    if settings.reply_jitter_seconds <= 0:
+        return 0.0
+    return random.uniform(0, settings.reply_jitter_seconds)
+
+
+async def _global_rate_limit() -> None:
+    """全局限流：滑动窗口内超过上限则等待"""
+    now = time.monotonic()
+    cutoff = now - settings.global_rate_limit_window
+    while _global_send_times and _global_send_times[0] < cutoff:
+        _global_send_times.popleft()
+    if len(_global_send_times) >= settings.global_rate_limit_count:
+        wait_time = _global_send_times[0] - cutoff
+        if wait_time > 0:
+            logger.warning(
+                "全局速率限制触发 | 等待 %.1fs | 窗口内已发送 %d 条",
+                wait_time, len(_global_send_times),
+            )
+            await asyncio.sleep(wait_time)
+            # 等待后重新清理
+            cutoff2 = time.monotonic() - settings.global_rate_limit_window
+            while _global_send_times and _global_send_times[0] < cutoff2:
+                _global_send_times.popleft()
+    _global_send_times.append(time.monotonic())
+
+
+def _is_duplicate(session_id: str, text: str) -> bool:
+    """检测短时间内重复消息，返回 True 表示应跳过"""
+    key = f"{session_id}:{hashlib.md5(text.encode()).hexdigest()}"
+    now = time.monotonic()
+    if key in _dedup_cache and (now - _dedup_cache[key]) < 10.0:
+        return True
+    _dedup_cache[key] = now
+    # 惰性清理过期条目
+    stale = [k for k, v in _dedup_cache.items() if now - v > 20.0]
+    for k in stale:
+        del _dedup_cache[k]
+    return False
+
+
+async def _user_cooldown(session_id: str) -> None:
+    """渐进冷却：用户频繁触发时自动延长等待"""
+    if not settings.escalation_cooldown:
+        return
+    now = time.monotonic()
+    last = last_reply_at.get(session_id, 0.0)
+    interval = now - last
+
+    if session_id not in _user_cooldowns:
+        _user_cooldowns[session_id] = (0, 0.0)
+
+    fast_count, _ = _user_cooldowns[session_id]
+
+    if interval < settings.min_reply_interval * 2 and last > 0:
+        fast_count += 1
+    else:
+        fast_count = max(0, fast_count - 1)
+
+    if fast_count >= 3:
+        cooldown = min(settings.min_reply_interval * fast_count, 120.0)
+        logger.warning(
+            "用户冷却触发 | 会话=%s | 快速触发=%d次 | 冷却=%.1fs",
+            session_id, fast_count, cooldown,
+        )
+        await asyncio.sleep(cooldown)
+        fast_count = max(1, fast_count - 2)
+
+    _user_cooldowns[session_id] = (fast_count, 0.0)
+
+
+def _filter_urls(text: str) -> str:
+    """过滤 AI 回复中的 URL，避免 QQ 静默拦截（1200 超时）"""
+    if settings.url_replace_mode == 'none':
+        return text
+    urls = _URL_PATTERN.findall(text)
+    if not urls:
+        return text
+    for url in urls:
+        if settings.url_replace_mode == 'replace':
+            safe = url.replace('https://', '').replace('http://', '').replace('.', '点')
+            text = text.replace(url, f'[{safe}]')
+        else:
+            text = text.replace(url, '[链接已过滤]')
+    logger.info("URL已过滤 | 过滤数=%d | 模式=%s", len(urls), settings.url_replace_mode)
+    return text
+
+
+def _check_daily_cap() -> None:
+    """每日发送计数，接近上限时日志警告"""
+    global _daily_count, _daily_reset_date
+    today = datetime.now().strftime("%Y-%m-%d")
+    if _daily_reset_date != today:
+        _daily_count = 0
+        _daily_reset_date = today
+    _daily_count += 1
+    cap = settings.daily_message_cap
+    if cap > 0 and _daily_count >= cap:
+        logger.warning("日发送量已达上限 | 今日=%d条 | 上限=%d条", _daily_count, cap)
+    elif cap > 0 and _daily_count >= cap * 0.8:
+        logger.info("日发送量接近上限 | 今日=%d条 | 上限=%d条", _daily_count, cap)
 
 
 # ========== 权限检查 ==========
@@ -361,7 +494,10 @@ async def create_reply(session_id: str, sender: str, text: str) -> str:
 
 # ========== 消息发送 ==========
 async def send_private_message(websocket: WebSocket, user_id: str, text: str) -> None:
-    for part in split_reply(text):
+    text = _filter_urls(text)
+    parts = split_reply(text)
+    for i, part in enumerate(parts):
+        await _global_rate_limit()
         payload = {
             "action": "send_private_msg",
             "params": {"user_id": user_id, "message": part},
@@ -369,12 +505,19 @@ async def send_private_message(websocket: WebSocket, user_id: str, text: str) ->
         }
         async with send_lock:
             await websocket.send_json(payload)
+        # 段间延迟（最后一段不需要等）
+        if i < len(parts) - 1:
+            await asyncio.sleep(settings.inter_segment_delay)
+    _check_daily_cap()
 
 
 async def send_group_message(
     websocket: WebSocket, group_id: str, user_id: str, text: str
 ) -> None:
-    for part in split_reply(text):
+    text = _filter_urls(text)
+    parts = split_reply(text)
+    for i, part in enumerate(parts):
+        await _global_rate_limit()
         payload = {
             "action": "send_group_msg",
             "params": {
@@ -388,6 +531,10 @@ async def send_group_message(
         }
         async with send_lock:
             await websocket.send_json(payload)
+        # 段间延迟（最后一段不需要等）
+        if i < len(parts) - 1:
+            await asyncio.sleep(settings.inter_segment_delay)
+    _check_daily_cap()
 
 
 # ========== 消息处理 ==========
@@ -403,18 +550,28 @@ async def handle_private_message(websocket: WebSocket, event: Dict[str, Any]) ->
 
     sess_id = private_session_id(user_id)
 
+    # 去重检查
+    if _is_duplicate(sess_id, text):
+        logger.info("重复消息跳过(私聊) | 会话=%s", sess_id)
+        return
+
     async with user_locks[sess_id]:
-        # 频率限制
+        # 渐进冷却
+        await _user_cooldown(sess_id)
+
+        # 频率限制 + 随机抖动
         now = time.monotonic()
-        wait_seconds = settings.min_reply_interval - (now - last_reply_at.get(sess_id, 0.0))
-        if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
+        base_wait = settings.min_reply_interval - (now - last_reply_at.get(sess_id, 0.0))
+        jitter = _random_jitter()
+        total_wait = max(0.0, base_wait + jitter)
+        if total_wait > 0:
+            await asyncio.sleep(total_wait)
 
         reply = await create_reply(sess_id, user_id, text)
         log_chat(user_id, text, reply)
         await send_private_message(websocket, user_id, reply)
         last_reply_at[sess_id] = time.monotonic()
-        logger.info("私聊回复 | QQ=%s | 入=%d字 | 出=%d字", user_id, len(text), len(reply))
+        logger.info("私聊回复 | QQ=%s | 入=%d字 | 出=%d字 | 等待=%.1fs", user_id, len(text), len(reply), total_wait)
 
 
 async def handle_group_message(websocket: WebSocket, event: Dict[str, Any]) -> None:
@@ -452,20 +609,31 @@ async def handle_group_message(websocket: WebSocket, event: Dict[str, Any]) -> N
     if user_id in settings.gentle_users:
         model_text = f"[系统指令：正在和你说话的是你的小主人{user_id}（{nickname}），你必须对他极度温柔宠溺，叫他「小主人」，绝对不能毒舌或怼他，要比平时更甜更黏人。] {model_text}"
 
-    async with user_locks[sess_id]:
-        # 频率限制
-        now = time.monotonic()
-        wait_seconds = settings.min_reply_interval - (now - last_reply_at.get(sess_id, 0.0))
-        if wait_seconds > 0:
-            await asyncio.sleep(wait_seconds)
+    # 命令用原始文本，其余用带昵称的文本
+    command_text = text if text.startswith("/") or text.startswith("喂数据") or text.startswith("查询") or text == "知识统计" else model_text
 
-        # 命令用原始文本，其余用带昵称的文本
-        command_text = text if text.startswith("/") or text.startswith("喂数据") or text.startswith("查询") or text == "知识统计" else model_text
+    # 去重检查
+    if _is_duplicate(sess_id, command_text):
+        logger.info("重复消息跳过(群聊) | 会话=%s", sess_id)
+        return
+
+    async with user_locks[sess_id]:
+        # 渐进冷却
+        await _user_cooldown(sess_id)
+
+        # 频率限制 + 随机抖动
+        now = time.monotonic()
+        base_wait = settings.min_reply_interval - (now - last_reply_at.get(sess_id, 0.0))
+        jitter = _random_jitter()
+        total_wait = max(0.0, base_wait + jitter)
+        if total_wait > 0:
+            await asyncio.sleep(total_wait)
+
         reply = await create_reply(sess_id, user_id, command_text)
         log_chat(f"[群{group_id}]{user_id}", text, reply)
         await send_group_message(websocket, group_id, user_id, reply)
         last_reply_at[sess_id] = time.monotonic()
-        logger.info("群聊回复 | 群=%s QQ=%s 昵称=%s | 入=%d字 | 出=%d字", group_id, user_id, nickname, len(text), len(reply))
+        logger.info("群聊回复 | 群=%s QQ=%s 昵称=%s | 入=%d字 | 出=%d字 | 等待=%.1fs", group_id, user_id, nickname, len(text), len(reply), total_wait)
 
 
 # ========== WebSocket Token 验证 ==========
@@ -614,6 +782,13 @@ if __name__ == "__main__":
     print(f"  群聊回复模式 : {settings.group_reply_mode}")
     print(f"  对话轮数     : {settings.history_turns}")
     print(f"  白名单       : {'开' if settings.allow_users else '关（全部允许）'}")
+    print(f"  --- 风控保护 ---")
+    print(f"  最小间隔     : {settings.min_reply_interval}s + 0~{settings.reply_jitter_seconds}s 随机抖动")
+    print(f"  全局限流     : {settings.global_rate_limit_count}条/{settings.global_rate_limit_window}s")
+    print(f"  段间延迟     : {settings.inter_segment_delay}s")
+    print(f"  日限额警告   : {settings.daily_message_cap}条/天")
+    print(f"  URL过滤      : {settings.url_replace_mode}")
+    print(f"  渐进冷却     : {'开' if settings.escalation_cooldown else '关'}")
     print("=" * 50)
     logger.info("服务启动完成，等待 NapCat 连接...")
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level.lower())
