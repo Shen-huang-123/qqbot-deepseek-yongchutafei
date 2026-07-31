@@ -281,6 +281,11 @@ _URL_PATTERN: re.Pattern = re.compile(
     r'https?://[^\s<>"\')\]>]+'
 )
 
+# ========== 循环对话检测 ==========
+_loop_tracker: Dict[str, Deque[str]] = defaultdict(lambda: deque(maxlen=6))  # 最近6条消息（3轮）的哈希
+_blocked_sessions: Set[str] = set()  # 被封锁的会话ID
+CLEANUP_INTERVAL = 3600  # 定期清理间隔（秒）
+
 
 def private_session_id(user_id: str) -> str:
     return f"private:{user_id}"
@@ -435,6 +440,82 @@ def _check_daily_cap() -> None:
         logger.info("日发送量接近上限 | 今日=%d条 | 上限=%d条", _daily_count, cap)
 
 
+def _detect_loop(session_id: str, text: str) -> bool:
+    """检测循环对话：连续3轮消息高度相似则判定为机器人对话"""
+    # 计算消息简化指纹（去空白、去标点后的哈希）
+    simplified = re.sub(r'\s+', '', text.strip())
+    simplified = re.sub(r'[，。！？、；：""''（）【】《》…—,.!?;:()\[\]{}-]', '', simplified)
+    if len(simplified) < 4:
+        return False  # 太短不检测
+    msg_hash = hashlib.md5(simplified.encode()).hexdigest()
+
+    tracker = _loop_tracker[session_id]
+    tracker.append(msg_hash)
+
+    # 需要至少 6 条（3轮对话 = 3条用户消息 + 3条bot消息之间检查）
+    if len(tracker) < 4:
+        return False
+
+    # 检查最近的用户消息（偶数位置：0, 2, 4... 是旧值，当前是最新）
+    # 简化方案：检查最近 4 条中有多少条是相同/相似的
+    recent = list(tracker)
+    unique = len(set(recent[-4:]))
+    if unique <= 2:
+        logger.warning(
+            "检测到循环对话 | 会话=%s | 最近4条唯一哈希=%d | 疑似机器人",
+            session_id, unique,
+        )
+        return True
+
+    return False
+
+
+def _block_session(session_id: str) -> None:
+    """封锁会话，停止回复"""
+    _blocked_sessions.add(session_id)
+    logger.warning("会话已封锁 | 会话=%s | 原因=疑似机器人循环对话", session_id)
+
+
+def _unblock_session(session_id: str) -> bool:
+    """解除会话封锁"""
+    if session_id in _blocked_sessions:
+        _blocked_sessions.discard(session_id)
+        _loop_tracker[session_id].clear()
+        histories[session_id].clear()
+        logger.info("会话已解除封锁 | 会话=%s", session_id)
+        return True
+    return False
+
+
+async def _periodic_cleanup() -> None:
+    """后台定期清理：每 CLEANUP_INTERVAL 秒清理过期历史和封锁状态"""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        try:
+            # 清理过期对话历史（保留 settings.history_turns 轮）
+            cleanup_old_history(keep_turns=settings.history_turns)
+            # 清理长期未使用的 loop tracker（避免内存泄漏）
+            stale_trackers = [
+                k for k in _loop_tracker
+                if k not in histories or not histories[k]
+            ]
+            for k in stale_trackers:
+                del _loop_tracker[k]
+            # 清理孤儿 blocked sessions
+            stale_blocks = [
+                k for k in _blocked_sessions
+                if k not in histories or not histories[k]
+            ]
+            for k in stale_blocks:
+                _blocked_sessions.discard(k)
+            logger.info(
+                "定期清理完成 | tracker剩余=%d | blocked剩余=%d",
+                len(_loop_tracker), len(_blocked_sessions),
+            )
+        except Exception:
+            logger.exception("定期清理异常")
+
+
 # ========== 权限检查 ==========
 def is_user_allowed(user_id: str) -> bool:
     return not settings.allow_users or user_id in settings.allow_users
@@ -541,10 +622,16 @@ async def create_reply(session_id: str, sender: str, text: str) -> str:
         if info["total_turns"] == 0 and mem_turns == 0:
             return "[空] 当前没有对话上下文喵~"
         recent_str = "\n".join([f"  {r[0]}: {r[1]}" for r in info["recent"][-4:]])
+        blocked = " [已封锁]" if session_id in _blocked_sessions else ""
         return (
-            f"[上下文] 内存 {mem_turns} 轮 | 持久化 {info['total_turns']} 轮\n"
+            f"[上下文] 内存 {mem_turns} 轮 | 持久化 {info['total_turns']} 轮{blocked}\n"
             f"最近对话：\n{recent_str}"
         )
+
+    if text == "/unblock":
+        if _unblock_session(session_id):
+            return "会话已解除封锁喵~可以继续聊天了"
+        return "当前会话没有被封锁喵~"
 
     if text == "/help":
         return (
@@ -631,11 +718,29 @@ async def handle_private_message(websocket: WebSocket, event: Dict[str, Any]) ->
     if not user_id or not text or not is_user_allowed(user_id):
         return
 
+    sess_id = private_session_id(user_id)
+
+    # 检查是否已被封锁
+    if sess_id in _blocked_sessions:
+        if text.strip() == "/unblock":
+            pass  # 允许 /unblock 穿透
+        else:
+            logger.debug("会话已封锁，跳过 | 会话=%s", sess_id)
+            return
+
+    # 循环对话检测（非命令消息才检测）
+    is_command = text.startswith("/") or text.startswith("喂数据") or text.startswith("查询") or text == "知识统计"
+    if not is_command and _detect_loop(sess_id, text):
+        _block_session(sess_id)
+        await send_private_message(
+            websocket, user_id,
+            "检测到对方是机器人，停止对话喵~",
+        )
+        return
+
     # 温柔目标：特殊对待（小主人）
     if user_id in settings.gentle_users:
         text = f"[系统指令：正在和你说话的是你的小主人（QQ号{user_id}），你必须对他极度温柔宠溺，叫他「小主人」，绝对不能毒舌或怼他，要比平时更甜更黏人。] {text}"
-
-    sess_id = private_session_id(user_id)
 
     # 去重检查
     if _is_duplicate(sess_id, text):
@@ -685,7 +790,16 @@ async def handle_group_message(websocket: WebSocket, event: Dict[str, Any]) -> N
 
     sess_id = group_session_id(group_id, user_id)
 
+    # 检查是否已被封锁
+    if sess_id in _blocked_sessions:
+        if text.strip() == "/unblock":
+            pass  # 允许 /unblock 穿透
+        else:
+            logger.debug("会话已封锁，跳过 | 会话=%s", sess_id)
+            return
+
     # 提取昵称
+    sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
     sender = event.get("sender") if isinstance(event.get("sender"), dict) else {}
     nickname = str(sender.get("card") or sender.get("nickname") or user_id)
 
@@ -697,7 +811,17 @@ async def handle_group_message(websocket: WebSocket, event: Dict[str, Any]) -> N
         model_text = f"[系统指令：正在和你说话的是你的小主人{user_id}（{nickname}），你必须对他极度温柔宠溺，叫他「小主人」，绝对不能毒舌或怼他，要比平时更甜更黏人。] {model_text}"
 
     # 命令用原始文本，其余用带昵称的文本
-    command_text = text if text.startswith("/") or text.startswith("喂数据") or text.startswith("查询") or text == "知识统计" else model_text
+    is_cmd = text.startswith("/") or text.startswith("喂数据") or text.startswith("查询") or text == "知识统计"
+    command_text = text if is_cmd else model_text
+
+    # 循环对话检测（非命令消息才检测）
+    if not is_cmd and _detect_loop(sess_id, command_text):
+        _block_session(sess_id)
+        await send_group_message(
+            websocket, group_id, user_id,
+            "检测到对方是机器人，停止对话喵~",
+        )
+        return
 
     # 去重检查
     if _is_duplicate(sess_id, command_text):
@@ -879,6 +1003,14 @@ if __name__ == "__main__":
     print(f"  日限额警告   : {settings.daily_message_cap}条/天")
     print(f"  URL过滤      : {settings.url_replace_mode}")
     print(f"  渐进冷却     : {'开' if settings.escalation_cooldown else '关'}")
+    print(f"  循环检测     : 3轮触发封锁")
+    print(f"  定期清理     : 每 {CLEANUP_INTERVAL}s")
     print("=" * 50)
+
+    # 启动后台定期清理任务
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.create_task(_periodic_cleanup())
+
     logger.info("服务启动完成，等待 NapCat 连接...")
     uvicorn.run(app, host=settings.host, port=settings.port, log_level=settings.log_level.lower())
